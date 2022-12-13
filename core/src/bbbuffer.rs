@@ -16,6 +16,9 @@ use core::{
         Ordering::{AcqRel, Acquire, Release},
     },
 };
+
+const CONSUMER_BIT: usize = 1 << { usize::BITS - 1 };
+
 #[derive(Debug)]
 /// A backing structure for a BBQueue. Can be used to create either
 /// a BBQueue or a split Producer/Consumer pair
@@ -47,8 +50,7 @@ pub struct BBBuffer<const N: usize> {
     /// Is there an active write grant?
     write_in_progress: AtomicBool,
 
-    /// Have we already split?
-    already_split: AtomicBool,
+    prod_con_count: AtomicUsize,
 }
 
 unsafe impl<const A: usize> Sync for BBBuffer<A> {}
@@ -86,16 +88,19 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// # }
     /// ```
     pub fn try_split(&'a self) -> Result<(Producer<'a, N>, Consumer<'a, N>)> {
-        if atomic::swap(&self.already_split, true, AcqRel) {
+        if atomic::fetch_or(&self.prod_con_count, CONSUMER_BIT, Acquire) & CONSUMER_BIT
+            == CONSUMER_BIT
+        {
             return Err(Error::AlreadySplit);
         }
+
+        atomic::fetch_add(&self.prod_con_count, 1, Acquire);
 
         unsafe {
             // Explicitly zero the data to avoid undefined behavior.
             // This is required, because we hand out references to the buffers,
             // which mean that creating them as references is technically UB for now
-            let mu_ptr = self.buf.get();
-            (*mu_ptr).as_mut_ptr().write_bytes(0u8, 1);
+            self.zero_buffer();
 
             let nn1 = NonNull::new_unchecked(self as *const _ as *mut _);
             let nn2 = NonNull::new_unchecked(self as *const _ as *mut _);
@@ -111,6 +116,83 @@ impl<'a, const N: usize> BBBuffer<N> {
                 },
             ))
         }
+    }
+
+    /// Attempts to create a new consumer if one has not already been created. If a consumer has already been created
+    /// an error will be returned.
+    ///
+    /// NOTE: If a producer has not already been created, the underlying buffer will be explicitly initialized
+    /// to zero. This may take a measurable amount of time, depending on the size
+    /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
+    /// is placed at `static` scope within the `.bss` region, the explicit initialization
+    /// will be elided (as it is already performed as part of memory initialization)
+    ///
+    pub fn consumer(&'a self) -> Result<Consumer<'a, N>> {
+        let prev = atomic::fetch_or(&self.prod_con_count, CONSUMER_BIT, Acquire);
+        if prev & CONSUMER_BIT == CONSUMER_BIT {
+            return Err(Error::AlreadySplit);
+        }
+        if prev & !CONSUMER_BIT == 0 {
+            unsafe {
+                self.zero_buffer();
+            }
+        }
+
+        Ok(Consumer {
+            bbq: unsafe { NonNull::new_unchecked(self as *const _ as *mut _) },
+            pd: PhantomData,
+        })
+    }
+
+    /// Attempts to create a new [`FrameConsumer`] if one has not already been created. If a consumer has already been created
+    /// an error will be returned.
+    ///
+    /// NOTE: If a producer has not already been created, the underlying buffer will be explicitly initialized
+    /// to zero. This may take a measurable amount of time, depending on the size
+    /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
+    /// is placed at `static` scope within the `.bss` region, the explicit initialization
+    /// will be elided (as it is already performed as part of memory initialization)
+    ///
+    pub fn frame_consumer(&'a self) -> Result<FrameConsumer<'a, N>> {
+        self.consumer().map(|consumer| FrameConsumer { consumer })
+    }
+
+    /// Creates a new producer with access to the underlying buffer.
+    ///
+    /// NOTE: If a producer has not already been created, the underlying buffer will be explicitly initialized
+    /// to zero. This may take a measurable amount of time, depending on the size
+    /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
+    /// is placed at `static` scope within the `.bss` region, the explicit initialization
+    /// will be elided (as it is already performed as part of memory initialization)
+    pub fn producer(&'a self) -> Producer<'a, N> {
+        let prev = self.prod_con_count.fetch_add(1, Acquire);
+        if prev & CONSUMER_BIT != CONSUMER_BIT || prev & !CONSUMER_BIT >= 1 {
+            unsafe {
+                self.zero_buffer();
+            }
+        }
+
+        Producer {
+            bbq: unsafe { NonNull::new_unchecked(self as *const _ as *mut _) },
+            pd: PhantomData,
+        }
+    }
+
+    /// Creates a new [`FrameProducer`] with access to the underlying buffer.
+    ///
+    /// NOTE: If a producer has not already been created, the underlying buffer will be explicitly initialized
+    /// to zero. This may take a measurable amount of time, depending on the size
+    /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
+    /// is placed at `static` scope within the `.bss` region, the explicit initialization
+    /// will be elided (as it is already performed as part of memory initialization)
+    pub fn frame_producer(&'a self) -> FrameProducer<'a, N> {
+        let producer = self.producer();
+        FrameProducer { producer }
+    }
+
+    unsafe fn zero_buffer(&self) {
+        let mu_ptr = self.buf.get();
+        (*mu_ptr).as_mut_ptr().write_bytes(0u8, 1);
     }
 
     /// Attempt to split the `BBBuffer` into `FrameConsumer` and `FrameProducer` halves
@@ -200,11 +282,13 @@ impl<'a, const N: usize> BBBuffer<N> {
         self.last.store(0, Release);
 
         // Mark the buffer as ready to be split
-        self.already_split.store(false, Release);
+        atomic::fetch_and(&self.prod_con_count, !CONSUMER_BIT, Release);
+        atomic::fetch_sub(&self.prod_con_count, 1, Release);
 
         Ok(())
     }
 
+    /*
     /// Attempt to release the Producer and Consumer in Framed mode
     ///
     /// This re-initializes the buffer so it may be split in a different mode at a later
@@ -222,7 +306,7 @@ impl<'a, const N: usize> BBBuffer<N> {
                 // Restore the wrapper types
                 (FrameProducer { producer }, FrameConsumer { consumer })
             })
-    }
+    }*/
 }
 
 impl<const A: usize> BBBuffer<A> {
@@ -275,8 +359,8 @@ impl<const A: usize> BBBuffer<A> {
             /// Owned by the Writer, "private"
             write_in_progress: AtomicBool::new(false),
 
-            /// We haven't split at the start
-            already_split: AtomicBool::new(false),
+            /// There are no producers or consumers yet
+            prod_con_count: AtomicUsize::new(0),
         }
     }
 }
@@ -1113,6 +1197,24 @@ mod atomic {
     }
 
     #[inline(always)]
+    pub fn fetch_or(atomic: &AtomicUsize, val: usize, _order: Ordering) -> usize {
+        free(|_| {
+            let prev = atomic.load(Acquire);
+            atomic.store(prev | val, Release);
+            prev
+        })
+    }
+
+    #[inline(always)]
+    pub fn fetch_and(atomic: &AtomicUsize, val: usize, _order: Ordering) -> usize {
+        free(|_| {
+            let prev = atomic.load(Acquire);
+            atomic.store(prev & val, Release);
+            prev
+        })
+    }
+
+    #[inline(always)]
     pub fn fetch_sub(atomic: &AtomicUsize, val: usize, _order: Ordering) -> usize {
         free(|_| {
             let prev = atomic.load(Acquire);
@@ -1138,6 +1240,16 @@ mod atomic {
     #[inline(always)]
     pub fn fetch_add(atomic: &AtomicUsize, val: usize, order: Ordering) -> usize {
         atomic.fetch_add(val, order)
+    }
+
+    #[inline(always)]
+    pub fn fetch_or(atomic: &AtomicUsize, val: usize, order: Ordering) -> usize {
+        atomic.fetch_or(val, order)
+    }
+
+    #[inline(always)]
+    pub fn fetch_and(atomic: &AtomicUsize, val: usize, order: Ordering) -> usize {
+        atomic.fetch_and(val, order)
     }
 
     #[inline(always)]
