@@ -20,10 +20,11 @@
 //! ## Local usage
 //!
 //! ```rust, no_run
-//! # use bbqueue::BBBuffer;
+//! # use bbqueue::BBStatic;
 //! #
 //! // Create a buffer with six elements
-//! let bb: BBBuffer<6> = BBBuffer::new();
+//! let bb: BBStatic<6> = bbqueue::new_static_queue!(6);
+//!
 //! let (mut prod, mut cons) = bb.try_split().unwrap();
 //!
 //! // Request space for one byte
@@ -49,10 +50,10 @@
 //! ## Static usage
 //!
 //! ```rust, no_run
-//! # use bbqueue::BBBuffer;
+//! # use bbqueue::BBStatic;
 //! #
 //! // Create a buffer with six elements
-//! static BB: BBBuffer<6> = BBBuffer::new();
+//! static BB: BBStatic<6> = bbqueue::new_static_queue!(6);
 //!
 //! fn main() {
 //!     // Split the bbqueue into producer and consumer halves.
@@ -99,8 +100,16 @@
 #![deny(missing_docs)]
 #![deny(warnings)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 mod bbbuffer;
 pub use bbbuffer::*;
+
+#[cfg(feature = "alloc")]
+mod arc;
+#[cfg(feature = "alloc")]
+pub use arc::*;
 
 pub mod framed;
 mod vusize;

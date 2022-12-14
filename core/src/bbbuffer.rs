@@ -17,14 +17,14 @@ use core::{
 
 const CONSUMER_BIT: usize = 1 << { usize::BITS - 1 };
 
-/// TODO
+/// `Storage` repersents the actual storage for a BBQueue
 pub trait Storage {
-    /// TODO
+    /// A type that points to the underlying storage impl
     type Pointer: StoragePointer;
 
-    /// TODO
+    /// Returns a reference to the underyling pointer
     fn get(&self) -> &Self::Pointer;
-    /// TODO
+    /// Returns a mutable reference to the underyling pointer
     fn get_mut(&mut self) -> &mut Self::Pointer;
 }
 
@@ -57,12 +57,12 @@ pub trait StoragePointer: Clone + core::fmt::Debug {
 /// TODO
 #[derive(Debug)]
 pub struct BufStorage<const N: usize> {
-    buf: UnsafeCell<[u8; N]>,
+    pub(crate) buf: UnsafeCell<[u8; N]>,
     /// Where the next byte will be written
-    write: AtomicUsize,
+    pub(crate) write: AtomicUsize,
 
     /// Where the next byte will be read from
-    read: AtomicUsize,
+    pub(crate) read: AtomicUsize,
 
     /// Used in the inverted case to mark the end of the
     /// readable streak. Otherwise will == sizeof::<self.buf>().
@@ -70,20 +70,20 @@ pub struct BufStorage<const N: usize> {
     /// place when entering an inverted condition, and Reader
     /// is responsible for moving it back to sizeof::<self.buf>()
     /// when exiting the inverted condition
-    last: AtomicUsize,
+    pub(crate) last: AtomicUsize,
 
     /// Used by the Writer to remember what bytes are currently
     /// allowed to be written to, but are not yet ready to be
     /// read from
-    reserve: AtomicUsize,
+    pub(crate) reserve: AtomicUsize,
 
     /// Is there an active read grant?
-    read_in_progress: AtomicBool,
+    pub(crate) read_in_progress: AtomicBool,
 
     /// Is there an active write grant?
-    write_in_progress: AtomicBool,
+    pub(crate) write_in_progress: AtomicBool,
 
-    prod_con_count: AtomicUsize,
+    pub(crate) prod_con_count: AtomicUsize,
 }
 
 unsafe impl<const N: usize> Send for BufStorage<N> {}
@@ -215,10 +215,10 @@ impl<'a, S: Storage> BBBuffer<S> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (prod, cons) = buffer.try_split().unwrap();
     ///
     /// // Not possible to split twice
@@ -358,10 +358,10 @@ impl<'a, S: Storage> BBBuffer<S> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (prod, cons) = buffer.try_split().unwrap();
     ///
     /// // Not possible to split twice
@@ -454,9 +454,10 @@ impl<S: Storage> BBBuffer<S> {
     /// the future.
     ///
     /// ```rust,no_run
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::{BBBuffer, BufStorage};
     ///
-    /// static BUF: BBBuffer<6> = BBBuffer::new();
+    /// static STORAGE: BufStorage<6> = BufStorage::new();
+    /// static BUF: BBBuffer<&'static BufStorage<6>> = BBBuffer::new(&STORAGE);
     ///
     /// fn main() {
     ///    let (prod, cons) = BUF.try_split().unwrap();
@@ -466,6 +467,18 @@ impl<S: Storage> BBBuffer<S> {
         Self { storage }
     }
 }
+
+/// Initializes a new static BBQueue
+#[macro_export]
+macro_rules! new_static_queue {
+    ($n: expr) => {{
+        static STORAGE: $crate::BufStorage<$n> = $crate::BufStorage::new();
+        $crate::BBBuffer::new(&STORAGE)
+    }};
+}
+
+/// A convinence type repersetning a static BBBuffer
+pub type BBStatic<const N: usize> = BBBuffer<&'static BufStorage<N>>;
 
 /// `Producer` is the primary interface for pushing data into a `BBBuffer`.
 /// There are various methods for obtaining a grant to write to the buffer, with
@@ -509,10 +522,11 @@ impl<P: StoragePointer> Producer<P> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
+    ///
     /// let (mut prod, cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
@@ -598,10 +612,10 @@ impl<P: StoragePointer> Producer<P> {
     /// ```
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (mut prod, mut cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
@@ -704,10 +718,10 @@ impl<P: StoragePointer> Consumer<P> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (mut prod, mut cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
@@ -836,10 +850,10 @@ impl<S: Storage> BBBuffer<S> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::{BBStatic, new_static_queue};
     ///
     /// // Create a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = new_static_queue!(6);
     /// assert_eq!(buffer.capacity(), 6);
     /// # // bbqueue test shim!
     /// # }
@@ -929,10 +943,10 @@ impl<P: StoragePointer> GrantW<P> {
     /// ```rust
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (mut prod, mut cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
@@ -1055,10 +1069,10 @@ impl<P: StoragePointer> GrantR<P> {
     /// ```
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (mut prod, mut cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
@@ -1152,10 +1166,10 @@ impl<'a, P: StoragePointer> SplitGrantR<'a, P> {
     /// ```
     /// # // bbqueue test shim!
     /// # fn bbqtest() {
-    /// use bbqueue::BBBuffer;
+    /// use bbqueue::BBStatic;
     ///
     /// // Create and split a new buffer of 6 elements
-    /// let buffer: BBBuffer<6> = BBBuffer::new();
+    /// let buffer: BBStatic<6> = bbqueue::new_static_queue!(6);
     /// let (mut prod, mut cons) = buffer.try_split().unwrap();
     ///
     /// // Successfully obtain and commit a grant of four bytes
