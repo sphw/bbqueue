@@ -99,8 +99,16 @@
 #![deny(missing_docs)]
 #![deny(warnings)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 mod bbbuffer;
 pub use bbbuffer::*;
+
+#[cfg(feature = "alloc")]
+mod arc;
+#[cfg(feature = "alloc")]
+pub use arc::*;
 
 pub mod framed;
 mod vusize;

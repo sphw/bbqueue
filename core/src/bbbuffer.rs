@@ -57,12 +57,12 @@ pub trait StoragePointer: Clone + core::fmt::Debug {
 /// TODO
 #[derive(Debug)]
 pub struct BufStorage<const N: usize> {
-    buf: UnsafeCell<[u8; N]>,
+    pub(crate) buf: UnsafeCell<[u8; N]>,
     /// Where the next byte will be written
-    write: AtomicUsize,
+    pub(crate) write: AtomicUsize,
 
     /// Where the next byte will be read from
-    read: AtomicUsize,
+    pub(crate) read: AtomicUsize,
 
     /// Used in the inverted case to mark the end of the
     /// readable streak. Otherwise will == sizeof::<self.buf>().
@@ -70,20 +70,20 @@ pub struct BufStorage<const N: usize> {
     /// place when entering an inverted condition, and Reader
     /// is responsible for moving it back to sizeof::<self.buf>()
     /// when exiting the inverted condition
-    last: AtomicUsize,
+    pub(crate) last: AtomicUsize,
 
     /// Used by the Writer to remember what bytes are currently
     /// allowed to be written to, but are not yet ready to be
     /// read from
-    reserve: AtomicUsize,
+    pub(crate) reserve: AtomicUsize,
 
     /// Is there an active read grant?
-    read_in_progress: AtomicBool,
+    pub(crate) read_in_progress: AtomicBool,
 
     /// Is there an active write grant?
-    write_in_progress: AtomicBool,
+    pub(crate) write_in_progress: AtomicBool,
 
-    prod_con_count: AtomicUsize,
+    pub(crate) prod_con_count: AtomicUsize,
 }
 
 unsafe impl<const N: usize> Send for BufStorage<N> {}
