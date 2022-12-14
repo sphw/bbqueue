@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
 
-    use bbqueue::{BBBuffer, Consumer, GrantR, GrantW, Producer};
+    use bbqueue::{BBBuffer, BufStorage, Consumer, GrantR, GrantW, Producer};
 
     enum Potato<'a, const N: usize> {
-        Tx((Producer<'a, N>, u8)),
-        Rx((Consumer<'a, N>, u8)),
-        TxG(GrantW<'a, N>),
-        RxG(GrantR<'a, N>),
+        Tx((Producer<&'a BufStorage<N>>, u8)),
+        Rx((Consumer<&'a BufStorage<N>>, u8)),
+        TxG(GrantW<&'a BufStorage<N>>),
+        RxG(GrantR<&'a BufStorage<N>>),
         Idle,
         Done,
     }
@@ -76,7 +76,8 @@ mod tests {
         }
     }
 
-    static BB: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
+    static BUF: BufStorage<BUFFER_SIZE> = BufStorage::new();
+    static BB: BBBuffer<&BufStorage<BUFFER_SIZE>> = BBBuffer::new(&BUF);
 
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::thread::spawn;

@@ -5,12 +5,10 @@ use crate::{
 use core::{
     cell::UnsafeCell,
     cmp::min,
-    marker::PhantomData,
-    mem::{forget, transmute, MaybeUninit},
+    mem::{forget, transmute},
     ops::{Deref, DerefMut},
-    ptr::NonNull,
     result::Result as CoreResult,
-    slice::from_raw_parts_mut,
+    slice::{self, from_raw_parts_mut},
     sync::atomic::{
         AtomicBool, AtomicUsize,
         Ordering::{AcqRel, Acquire, Release},
@@ -19,12 +17,47 @@ use core::{
 
 const CONSUMER_BIT: usize = 1 << { usize::BITS - 1 };
 
-#[derive(Debug)]
-/// A backing structure for a BBQueue. Can be used to create either
-/// a BBQueue or a split Producer/Consumer pair
-pub struct BBBuffer<const N: usize> {
-    buf: UnsafeCell<MaybeUninit<[u8; N]>>,
+/// TODO
+pub trait Storage {
+    /// TODO
+    type Pointer: StoragePointer;
 
+    /// TODO
+    fn get(&self) -> &Self::Pointer;
+    /// TODO
+    fn get_mut(&mut self) -> &mut Self::Pointer;
+}
+
+/// TODO
+pub trait StoragePointer: Clone + core::fmt::Debug {
+    /// TODO
+    const CAPACITY: usize;
+    /// TODO
+    fn get_buf_ptr(&self) -> *mut u8;
+    /// TODO
+    unsafe fn zero_buffer(&self);
+    /// TODO
+    fn write(&self) -> &AtomicUsize;
+    /// TODO
+    fn read(&self) -> &AtomicUsize;
+    /// TODO
+    fn last(&self) -> &AtomicUsize;
+    /// TODO
+    fn reserve(&self) -> &AtomicUsize;
+    /// TODO
+    fn read_in_progress(&self) -> &AtomicBool;
+    /// TODO
+    fn write_in_progress(&self) -> &AtomicBool;
+    /// TODO
+    fn prod_con_count(&self) -> &AtomicUsize;
+    /// TODO
+    fn ptr_eq(&self, other: &Self) -> bool;
+}
+
+/// TODO
+#[derive(Debug)]
+pub struct BufStorage<const N: usize> {
+    buf: UnsafeCell<[u8; N]>,
     /// Where the next byte will be written
     write: AtomicUsize,
 
@@ -53,9 +86,120 @@ pub struct BBBuffer<const N: usize> {
     prod_con_count: AtomicUsize,
 }
 
-unsafe impl<const A: usize> Sync for BBBuffer<A> {}
+unsafe impl<const N: usize> Send for BufStorage<N> {}
+unsafe impl<const N: usize> Sync for BufStorage<N> {}
 
-impl<'a, const N: usize> BBBuffer<N> {
+impl<const N: usize> BufStorage<N> {
+    /// TODO
+    pub const fn new() -> Self {
+        Self {
+            buf: UnsafeCell::new([0; N]),
+            /// Owned by the writer
+            write: AtomicUsize::new(0),
+
+            /// Owned by the reader
+            read: AtomicUsize::new(0),
+
+            /// Cooperatively owned
+            ///
+            /// NOTE: This should generally be initialized as size_of::<self.buf>(), however
+            /// this would prevent the structure from being entirely zero-initialized,
+            /// and can cause the .data section to be much larger than necessary. By
+            /// forcing the `last` pointer to be zero initially, we place the structure
+            /// in an "inverted" condition, which will be resolved on the first commited
+            /// bytes that are written to the structure.
+            ///
+            /// When read == last == write, no bytes will be allowed to be read (good), but
+            /// write grants can be given out (also good).
+            last: AtomicUsize::new(0),
+
+            /// Owned by the Writer, "private"
+            reserve: AtomicUsize::new(0),
+
+            /// Owned by the Reader, "private"
+            read_in_progress: AtomicBool::new(false),
+
+            /// Owned by the Writer, "private"
+            write_in_progress: AtomicBool::new(false),
+
+            prod_con_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<'a, const N: usize> Storage for &'a BufStorage<N> {
+    type Pointer = Self;
+
+    fn get(&self) -> &Self::Pointer {
+        self
+    }
+
+    fn get_mut(&mut self) -> &mut Self::Pointer {
+        self
+    }
+}
+
+impl<'a, const N: usize> StoragePointer for &'a BufStorage<N> {
+    const CAPACITY: usize = N;
+
+    fn get_buf_ptr(&self) -> *mut u8 {
+        unsafe { (*self.buf.get()).as_mut_ptr() }
+    }
+
+    unsafe fn zero_buffer(&self) {
+        unsafe { (*self.buf.get()).as_mut_ptr().write_bytes(0, N) };
+    }
+
+    #[inline]
+    fn write(&self) -> &AtomicUsize {
+        &self.write
+    }
+
+    #[inline]
+    fn read(&self) -> &AtomicUsize {
+        &self.read
+    }
+
+    #[inline]
+    fn last(&self) -> &AtomicUsize {
+        &self.last
+    }
+
+    #[inline]
+    fn reserve(&self) -> &AtomicUsize {
+        &self.reserve
+    }
+
+    #[inline]
+    fn read_in_progress(&self) -> &AtomicBool {
+        &self.read_in_progress
+    }
+
+    #[inline]
+    fn write_in_progress(&self) -> &AtomicBool {
+        &self.write_in_progress
+    }
+
+    #[inline]
+    fn prod_con_count(&self) -> &AtomicUsize {
+        &self.prod_con_count
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        core::ptr::eq(*self, *other)
+    }
+}
+
+#[derive(Debug)]
+/// A backing structure for a BBQueue. Can be used to create either
+/// a BBQueue or a split Producer/Consumer pair
+pub struct BBBuffer<S: Storage> {
+    storage: S,
+}
+
+//unsafe impl<const A: usize> Sync for BBBuffer<A> {}
+
+impl<'a, S: Storage> BBBuffer<S> {
     /// Attempt to split the `BBBuffer` into `Consumer` and `Producer` halves to gain access to the
     /// buffer. If buffer has already been split, an error will be returned.
     ///
@@ -87,32 +231,28 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn try_split(&'a self) -> Result<(Producer<'a, N>, Consumer<'a, N>)> {
-        if atomic::fetch_or(&self.prod_con_count, CONSUMER_BIT, Acquire) & CONSUMER_BIT
+    pub fn try_split(&'a self) -> Result<(Producer<S::Pointer>, Consumer<S::Pointer>)> {
+        let storage = self.storage.get();
+        if atomic::fetch_or(storage.prod_con_count(), CONSUMER_BIT, Acquire) & CONSUMER_BIT
             == CONSUMER_BIT
         {
             return Err(Error::AlreadySplit);
         }
 
-        atomic::fetch_add(&self.prod_con_count, 1, Acquire);
+        atomic::fetch_add(storage.prod_con_count(), 1, Acquire);
 
         unsafe {
             // Explicitly zero the data to avoid undefined behavior.
             // This is required, because we hand out references to the buffers,
             // which mean that creating them as references is technically UB for now
-            self.zero_buffer();
-
-            let nn1 = NonNull::new_unchecked(self as *const _ as *mut _);
-            let nn2 = NonNull::new_unchecked(self as *const _ as *mut _);
+            self.storage.get().zero_buffer();
 
             Ok((
                 Producer {
-                    bbq: nn1,
-                    pd: PhantomData,
+                    ptr: self.storage.get().clone(),
                 },
                 Consumer {
-                    bbq: nn2,
-                    pd: PhantomData,
+                    ptr: self.storage.get().clone(),
                 },
             ))
         }
@@ -127,20 +267,19 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// is placed at `static` scope within the `.bss` region, the explicit initialization
     /// will be elided (as it is already performed as part of memory initialization)
     ///
-    pub fn consumer(&'a self) -> Result<Consumer<'a, N>> {
-        let prev = atomic::fetch_or(&self.prod_con_count, CONSUMER_BIT, Acquire);
+    pub fn consumer(&'a self) -> Result<Consumer<S::Pointer>> {
+        let prev = atomic::fetch_or(&self.storage.get().prod_con_count(), CONSUMER_BIT, Acquire);
         if prev & CONSUMER_BIT == CONSUMER_BIT {
             return Err(Error::AlreadySplit);
         }
         if prev & !CONSUMER_BIT == 0 {
             unsafe {
-                self.zero_buffer();
+                self.storage.get().zero_buffer();
             }
         }
 
         Ok(Consumer {
-            bbq: unsafe { NonNull::new_unchecked(self as *const _ as *mut _) },
-            pd: PhantomData,
+            ptr: self.storage.get().clone(),
         })
     }
 
@@ -153,7 +292,7 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// is placed at `static` scope within the `.bss` region, the explicit initialization
     /// will be elided (as it is already performed as part of memory initialization)
     ///
-    pub fn frame_consumer(&'a self) -> Result<FrameConsumer<'a, N>> {
+    pub fn frame_consumer(&'a self) -> Result<FrameConsumer<S::Pointer>> {
         self.consumer().map(|consumer| FrameConsumer { consumer })
     }
 
@@ -164,17 +303,16 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
     /// is placed at `static` scope within the `.bss` region, the explicit initialization
     /// will be elided (as it is already performed as part of memory initialization)
-    pub fn producer(&'a self) -> Producer<'a, N> {
-        let prev = self.prod_con_count.fetch_add(1, Acquire);
+    pub fn producer(&'a self) -> Producer<S::Pointer> {
+        let prev = self.storage.get().prod_con_count().fetch_add(1, Acquire);
         if prev & CONSUMER_BIT != CONSUMER_BIT || prev & !CONSUMER_BIT >= 1 {
             unsafe {
-                self.zero_buffer();
+                self.storage.get().zero_buffer();
             }
         }
 
         Producer {
-            bbq: unsafe { NonNull::new_unchecked(self as *const _ as *mut _) },
-            pd: PhantomData,
+            ptr: self.storage.get().clone(),
         }
     }
 
@@ -185,14 +323,9 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// of the buffer. This is necessary to prevent undefined behavior. If the buffer
     /// is placed at `static` scope within the `.bss` region, the explicit initialization
     /// will be elided (as it is already performed as part of memory initialization)
-    pub fn frame_producer(&'a self) -> FrameProducer<'a, N> {
+    pub fn frame_producer(&'a self) -> FrameProducer<S::Pointer> {
         let producer = self.producer();
         FrameProducer { producer }
-    }
-
-    unsafe fn zero_buffer(&self) {
-        let mu_ptr = self.buf.get();
-        (*mu_ptr).as_mut_ptr().write_bytes(0u8, 1);
     }
 
     /// Attempt to split the `BBBuffer` into `FrameConsumer` and `FrameProducer` halves
@@ -207,7 +340,9 @@ impl<'a, const N: usize> BBBuffer<N> {
     ///
     /// NOTE:  If the `thumbv6` feature is selected, this function takes a short critical
     /// section while splitting.
-    pub fn try_split_framed(&'a self) -> Result<(FrameProducer<'a, N>, FrameConsumer<'a, N>)> {
+    pub fn try_split_framed(
+        &'a self,
+    ) -> Result<(FrameProducer<S::Pointer>, FrameConsumer<S::Pointer>)> {
         let (producer, consumer) = self.try_split()?;
         Ok((FrameProducer { producer }, FrameConsumer { consumer }))
     }
@@ -247,24 +382,25 @@ impl<'a, const N: usize> BBBuffer<N> {
     /// ```
     pub fn try_release(
         &'a self,
-        prod: Producer<'a, N>,
-        cons: Consumer<'a, N>,
-    ) -> CoreResult<(), (Producer<'a, N>, Consumer<'a, N>)> {
+        prod: Producer<S::Pointer>,
+        cons: Consumer<S::Pointer>,
+    ) -> CoreResult<(), (Producer<S::Pointer>, Consumer<S::Pointer>)> {
         // Note: Re-entrancy is not possible because we require ownership
         // of the producer and consumer, which are not cloneable. We also
         // can assume the buffer has been split, because
 
         // Are these our producers and consumers?
-        let our_prod = prod.bbq.as_ptr() as *const Self == self;
-        let our_cons = cons.bbq.as_ptr() as *const Self == self;
+        let ptr = self.storage.get();
+        let our_prod = prod.ptr.ptr_eq(self.storage.get());
+        let our_cons = cons.ptr.ptr_eq(self.storage.get());
 
         if !(our_prod && our_cons) {
             // Can't release, not our producer and consumer
             return Err((prod, cons));
         }
 
-        let wr_in_progress = self.write_in_progress.load(Acquire);
-        let rd_in_progress = self.read_in_progress.load(Acquire);
+        let wr_in_progress = ptr.write_in_progress().load(Acquire);
+        let rd_in_progress = ptr.read_in_progress().load(Acquire);
 
         if wr_in_progress || rd_in_progress {
             // Can't release, active grant(s) in progress
@@ -276,14 +412,14 @@ impl<'a, const N: usize> BBBuffer<N> {
         drop(cons);
 
         // Re-initialize the buffer (not totally needed, but nice to do)
-        self.write.store(0, Release);
-        self.read.store(0, Release);
-        self.reserve.store(0, Release);
-        self.last.store(0, Release);
+        ptr.write().store(0, Release);
+        ptr.read().store(0, Release);
+        ptr.reserve().store(0, Release);
+        ptr.last().store(0, Release);
 
         // Mark the buffer as ready to be split
-        atomic::fetch_and(&self.prod_con_count, !CONSUMER_BIT, Release);
-        atomic::fetch_sub(&self.prod_con_count, 1, Release);
+        atomic::fetch_and(ptr.prod_con_count(), !CONSUMER_BIT, Release);
+        atomic::fetch_sub(ptr.prod_con_count(), 1, Release);
 
         Ok(())
     }
@@ -309,7 +445,7 @@ impl<'a, const N: usize> BBBuffer<N> {
     }*/
 }
 
-impl<const A: usize> BBBuffer<A> {
+impl<S: Storage> BBBuffer<S> {
     /// Create a new constant inner portion of a `BBBuffer`.
     ///
     /// NOTE: This is only necessary to use when creating a `BBBuffer` at static
@@ -326,42 +462,8 @@ impl<const A: usize> BBBuffer<A> {
     ///    let (prod, cons) = BUF.try_split().unwrap();
     /// }
     /// ```
-    pub const fn new() -> Self {
-        Self {
-            // This will not be initialized until we split the buffer
-            buf: UnsafeCell::new(MaybeUninit::uninit()),
-
-            /// Owned by the writer
-            write: AtomicUsize::new(0),
-
-            /// Owned by the reader
-            read: AtomicUsize::new(0),
-
-            /// Cooperatively owned
-            ///
-            /// NOTE: This should generally be initialized as size_of::<self.buf>(), however
-            /// this would prevent the structure from being entirely zero-initialized,
-            /// and can cause the .data section to be much larger than necessary. By
-            /// forcing the `last` pointer to be zero initially, we place the structure
-            /// in an "inverted" condition, which will be resolved on the first commited
-            /// bytes that are written to the structure.
-            ///
-            /// When read == last == write, no bytes will be allowed to be read (good), but
-            /// write grants can be given out (also good).
-            last: AtomicUsize::new(0),
-
-            /// Owned by the Writer, "private"
-            reserve: AtomicUsize::new(0),
-
-            /// Owned by the Reader, "private"
-            read_in_progress: AtomicBool::new(false),
-
-            /// Owned by the Writer, "private"
-            write_in_progress: AtomicBool::new(false),
-
-            /// There are no producers or consumers yet
-            prod_con_count: AtomicUsize::new(0),
-        }
+    pub const fn new(storage: S) -> Self {
+        Self { storage }
     }
 }
 
@@ -389,14 +491,13 @@ impl<const A: usize> BBBuffer<A> {
 ///
 /// See [this github issue](https://github.com/jamesmunns/bbqueue/issues/38) for a
 /// discussion of grant methods that could be added in the future.
-pub struct Producer<'a, const N: usize> {
-    bbq: NonNull<BBBuffer<N>>,
-    pd: PhantomData<&'a ()>,
+pub struct Producer<P> {
+    ptr: P,
 }
 
-unsafe impl<'a, const N: usize> Send for Producer<'a, N> {}
+//unsafe impl<'a, const N: usize> Send for Producer<'a, N> {}
 
-impl<'a, const N: usize> Producer<'a, N> {
+impl<P: StoragePointer> Producer<P> {
     /// Request a writable, contiguous section of memory of exactly
     /// `sz` bytes. If the buffer size requested is not available,
     /// an error will be returned.
@@ -429,18 +530,18 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<'a, N>> {
-        let inner = unsafe { &self.bbq.as_ref() };
+    pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<P>> {
+        //let inner = unsafe { &self.bbq.as_ref() };
 
-        if atomic::swap(&inner.write_in_progress, true, AcqRel) {
+        if atomic::swap(self.ptr.write_in_progress(), true, AcqRel) {
             return Err(Error::GrantInProgress);
         }
 
         // Writer component. Must never write to `read`,
         // be careful writing to `load`
-        let write = inner.write.load(Acquire);
-        let read = inner.read.load(Acquire);
-        let max = N;
+        let write = self.ptr.write().load(Acquire);
+        let read = self.ptr.read().load(Acquire);
+        let max = P::CAPACITY;
         let already_inverted = write < read;
 
         let start = if already_inverted {
@@ -449,42 +550,40 @@ impl<'a, const N: usize> Producer<'a, N> {
                 write
             } else {
                 // Inverted, no room is available
-                inner.write_in_progress.store(false, Release);
+                self.ptr.write_in_progress().store(false, Release);
                 return Err(Error::InsufficientSize);
             }
+        } else if write + sz <= max {
+            // Non inverted condition
+            write
         } else {
-            if write + sz <= max {
-                // Non inverted condition
-                write
-            } else {
-                // Not inverted, but need to go inverted
+            // Not inverted, but need to go inverted
 
-                // NOTE: We check sz < read, NOT <=, because
-                // write must never == read in an inverted condition, since
-                // we will then not be able to tell if we are inverted or not
-                if sz < read {
-                    // Invertible situation
-                    0
-                } else {
-                    // Not invertible, no space
-                    inner.write_in_progress.store(false, Release);
-                    return Err(Error::InsufficientSize);
-                }
+            // NOTE: We check sz < read, NOT <=, because
+            // write must never == read in an inverted condition, since
+            // we will then not be able to tell if we are inverted or not
+            if sz < read {
+                // Invertible situation
+                0
+            } else {
+                // Not invertible, no space
+                self.ptr.write_in_progress().store(false, Release);
+                return Err(Error::InsufficientSize);
             }
         };
 
         // Safe write, only viewed by this task
-        inner.reserve.store(start + sz, Release);
+        self.ptr.reserve().store(start + sz, Release);
 
         // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
         // are all `#[repr(Transparent)]
-        let start_of_buf_ptr = inner.buf.get().cast::<u8>();
+        let start_of_buf_ptr = self.ptr.get_buf_ptr();
         let grant_slice =
             unsafe { from_raw_parts_mut(start_of_buf_ptr.offset(start as isize), sz) };
 
         Ok(GrantW {
             buf: grant_slice,
-            bbq: self.bbq,
+            ptr: self.ptr.clone(),
             to_commit: 0,
         })
     }
@@ -527,18 +626,16 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn grant_max_remaining(&mut self, mut sz: usize) -> Result<GrantW<'a, N>> {
-        let inner = unsafe { &self.bbq.as_ref() };
-
-        if atomic::swap(&inner.write_in_progress, true, AcqRel) {
+    pub fn grant_max_remaining(&mut self, mut sz: usize) -> Result<GrantW<P>> {
+        if atomic::swap(&self.ptr.write_in_progress(), true, AcqRel) {
             return Err(Error::GrantInProgress);
         }
 
         // Writer component. Must never write to `read`,
         // be careful writing to `load`
-        let write = inner.write.load(Acquire);
-        let read = inner.read.load(Acquire);
-        let max = N;
+        let write = self.ptr.write().load(Acquire);
+        let read = self.ptr.read().load(Acquire);
+        let max = P::CAPACITY;
 
         let already_inverted = write < read;
 
@@ -551,57 +648,54 @@ impl<'a, const N: usize> Producer<'a, N> {
                 write
             } else {
                 // Inverted, no room is available
-                inner.write_in_progress.store(false, Release);
+                self.ptr.write_in_progress().store(false, Release);
                 return Err(Error::InsufficientSize);
             }
+        } else if write != max {
+            // Some (or all) room remaining in un-inverted case
+            sz = min(max - write, sz);
+            write
         } else {
-            if write != max {
-                // Some (or all) room remaining in un-inverted case
-                sz = min(max - write, sz);
-                write
-            } else {
-                // Not inverted, but need to go inverted
+            // Not inverted, but need to go inverted
 
-                // NOTE: We check read > 1, NOT read >= 1, because
-                // write must never == read in an inverted condition, since
-                // we will then not be able to tell if we are inverted or not
-                if read > 1 {
-                    sz = min(read - 1, sz);
-                    0
-                } else {
-                    // Not invertible, no space
-                    inner.write_in_progress.store(false, Release);
-                    return Err(Error::InsufficientSize);
-                }
+            // NOTE: We check read > 1, NOT read >= 1, because
+            // write must never == read in an inverted condition, since
+            // we will then not be able to tell if we are inverted or not
+            if read > 1 {
+                sz = min(read - 1, sz);
+                0
+            } else {
+                // Not invertible, no space
+                self.ptr.write_in_progress().store(false, Release);
+                return Err(Error::InsufficientSize);
             }
         };
 
         // Safe write, only viewed by this task
-        inner.reserve.store(start + sz, Release);
+        self.ptr.reserve().store(start + sz, Release);
 
         // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
         // are all `#[repr(Transparent)]
-        let start_of_buf_ptr = inner.buf.get().cast::<u8>();
+        let start_of_buf_ptr = self.ptr.get_buf_ptr();
         let grant_slice =
             unsafe { from_raw_parts_mut(start_of_buf_ptr.offset(start as isize), sz) };
 
         Ok(GrantW {
             buf: grant_slice,
-            bbq: self.bbq,
+            ptr: self.ptr.clone(),
             to_commit: 0,
         })
     }
 }
 
 /// `Consumer` is the primary interface for reading data from a `BBBuffer`.
-pub struct Consumer<'a, const N: usize> {
-    bbq: NonNull<BBBuffer<N>>,
-    pd: PhantomData<&'a ()>,
+pub struct Consumer<P> {
+    ptr: P,
 }
 
-unsafe impl<'a, const N: usize> Send for Consumer<'a, N> {}
+// unsafe impl<'a, const N: usize> Send for Consumer<'a, N> {}
 
-impl<'a, const N: usize> Consumer<'a, N> {
+impl<P: StoragePointer> Consumer<P> {
     /// Obtains a contiguous slice of committed bytes. This slice may not
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
@@ -632,16 +726,14 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn read(&mut self) -> Result<GrantR<'a, N>> {
-        let inner = unsafe { &self.bbq.as_ref() };
-
-        if atomic::swap(&inner.read_in_progress, true, AcqRel) {
+    pub fn read(&mut self) -> Result<GrantR<P>> {
+        if atomic::swap(self.ptr.read_in_progress(), true, AcqRel) {
             return Err(Error::GrantInProgress);
         }
 
-        let write = inner.write.load(Acquire);
-        let last = inner.last.load(Acquire);
-        let mut read = inner.read.load(Acquire);
+        let write = self.ptr.write().load(Acquire);
+        let last = self.ptr.last().load(Acquire);
+        let mut read = self.ptr.read().load(Acquire);
 
         // Resolve the inverted case or end of read
         if (read == last) && (write < read) {
@@ -654,7 +746,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
             //   Commit does not check read, but if Grant has started an inversion,
             //   grant could move Last to the prior write position
             // MOVING READ BACKWARDS!
-            inner.read.store(0, Release);
+            self.ptr.read().store(0, Release);
         }
 
         let sz = if write < read {
@@ -666,34 +758,32 @@ impl<'a, const N: usize> Consumer<'a, N> {
         } - read;
 
         if sz == 0 {
-            inner.read_in_progress.store(false, Release);
+            self.ptr.read_in_progress().store(false, Release);
             return Err(Error::InsufficientSize);
         }
 
         // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
         // are all `#[repr(Transparent)]
-        let start_of_buf_ptr = inner.buf.get().cast::<u8>();
+        let start_of_buf_ptr = self.ptr.get_buf_ptr();
         let grant_slice = unsafe { from_raw_parts_mut(start_of_buf_ptr.offset(read as isize), sz) };
 
         Ok(GrantR {
             buf: grant_slice,
-            bbq: self.bbq,
+            ptr: self.ptr.clone(),
             to_release: 0,
         })
     }
 
     /// Obtains two disjoint slices, which are each contiguous of committed bytes.
     /// Combined these contain all previously commited data.
-    pub fn split_read(&mut self) -> Result<SplitGrantR<'a, N>> {
-        let inner = unsafe { &self.bbq.as_ref() };
-
-        if atomic::swap(&inner.read_in_progress, true, AcqRel) {
+    pub fn split_read(&mut self) -> Result<SplitGrantR<'_, P>> {
+        if atomic::swap(self.ptr.read_in_progress(), true, AcqRel) {
             return Err(Error::GrantInProgress);
         }
 
-        let write = inner.write.load(Acquire);
-        let last = inner.last.load(Acquire);
-        let mut read = inner.read.load(Acquire);
+        let write = self.ptr.write().load(Acquire);
+        let last = self.ptr.last().load(Acquire);
+        let mut read = self.ptr.read().load(Acquire);
 
         // Resolve the inverted case or end of read
         if (read == last) && (write < read) {
@@ -706,7 +796,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
             //   Commit does not check read, but if Grant has started an inversion,
             //   grant could move Last to the prior write position
             // MOVING READ BACKWARDS!
-            inner.read.store(0, Release);
+            self.ptr.read().store(0, Release);
         }
 
         let (sz1, sz2) = if write < read {
@@ -718,13 +808,13 @@ impl<'a, const N: usize> Consumer<'a, N> {
         };
 
         if sz1 == 0 {
-            inner.read_in_progress.store(false, Release);
+            self.ptr.read_in_progress().store(false, Release);
             return Err(Error::InsufficientSize);
         }
 
         // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
         // are all `#[repr(Transparent)]
-        let start_of_buf_ptr = inner.buf.get().cast::<u8>();
+        let start_of_buf_ptr = self.ptr.get_buf_ptr();
         let grant_slice1 =
             unsafe { from_raw_parts_mut(start_of_buf_ptr.offset(read as isize), sz1) };
         let grant_slice2 = unsafe { from_raw_parts_mut(start_of_buf_ptr, sz2) };
@@ -732,13 +822,13 @@ impl<'a, const N: usize> Consumer<'a, N> {
         Ok(SplitGrantR {
             buf1: grant_slice1,
             buf2: grant_slice2,
-            bbq: self.bbq,
+            ptr: &self.ptr,
             to_release: 0,
         })
     }
 }
 
-impl<const N: usize> BBBuffer<N> {
+impl<S: Storage> BBBuffer<S> {
     /// Returns the size of the backing storage.
     ///
     /// This is the maximum number of bytes that can be stored in this queue.
@@ -760,7 +850,7 @@ impl<const N: usize> BBBuffer<N> {
     /// # }
     /// ```
     pub const fn capacity(&self) -> usize {
-        N
+        <S::Pointer as StoragePointer>::CAPACITY
     }
 }
 
@@ -775,13 +865,13 @@ impl<const N: usize> BBBuffer<N> {
 /// If the `thumbv6` feature is selected, dropping the grant
 /// without committing it takes a short critical section,
 #[derive(Debug, PartialEq)]
-pub struct GrantW<'a, const N: usize> {
-    pub(crate) buf: &'a mut [u8],
-    bbq: NonNull<BBBuffer<N>>,
+pub struct GrantW<P: StoragePointer> {
+    pub(crate) buf: *mut [u8],
+    ptr: P,
     pub(crate) to_commit: usize,
 }
 
-unsafe impl<'a, const N: usize> Send for GrantW<'a, N> {}
+unsafe impl<P: StoragePointer> Send for GrantW<P> {}
 
 /// A structure representing a contiguous region of memory that
 /// may be read from, and potentially "released" (or cleared)
@@ -796,28 +886,30 @@ unsafe impl<'a, const N: usize> Send for GrantW<'a, N> {}
 /// If the `thumbv6` feature is selected, dropping the grant
 /// without releasing it takes a short critical section,
 #[derive(Debug, PartialEq)]
-pub struct GrantR<'a, const N: usize> {
-    pub(crate) buf: &'a mut [u8],
-    bbq: NonNull<BBBuffer<N>>,
+pub struct GrantR<P: StoragePointer> {
+    pub(crate) buf: *mut [u8],
+    ptr: P,
     pub(crate) to_release: usize,
 }
+
+unsafe impl<P: StoragePointer> Send for GrantR<P> {}
 
 /// A structure representing up to two contiguous regions of memory that
 /// may be read from, and potentially "released" (or cleared)
 /// from the queue
 #[derive(Debug, PartialEq)]
-pub struct SplitGrantR<'a, const N: usize> {
+pub struct SplitGrantR<'a, P: StoragePointer> {
     pub(crate) buf1: &'a mut [u8],
     pub(crate) buf2: &'a mut [u8],
-    bbq: NonNull<BBBuffer<N>>,
+    ptr: &'a P,
     pub(crate) to_release: usize,
 }
 
-unsafe impl<'a, const N: usize> Send for GrantR<'a, N> {}
+// unsafe impl<'a, const N: usize> Send for GrantR<'a, N> {}
 
-unsafe impl<'a, const N: usize> Send for SplitGrantR<'a, N> {}
+// unsafe impl<'a, const N: usize> Send for SplitGrantR<'a, N> {}
 
-impl<'a, const N: usize> GrantW<'a, N> {
+impl<P: StoragePointer> GrantW<P> {
     /// Finalizes a writable grant given by `grant()` or `grant_max()`.
     /// This makes the data available to be read via `read()`. This consumes
     /// the grant.
@@ -855,8 +947,9 @@ impl<'a, const N: usize> GrantW<'a, N> {
     /// # bbqtest();
     /// # }
     /// ```
+    #[inline]
     pub fn buf(&mut self) -> &mut [u8] {
-        self.buf
+        unsafe { &mut *self.buf }
     }
 
     /// Sometimes, it's not possible for the lifetimes to check out. For example,
@@ -871,17 +964,15 @@ impl<'a, const N: usize> GrantW<'a, N> {
     /// Additionally, you must ensure that a separate reference to this data is not created
     /// to this data, e.g. using `DerefMut` or the `buf()` method of this grant.
     pub unsafe fn as_static_mut_buf(&mut self) -> &'static mut [u8] {
-        transmute::<&mut [u8], &'static mut [u8]>(self.buf)
+        &mut *self.buf
     }
 
     #[inline(always)]
     pub(crate) fn commit_inner(&mut self, used: usize) {
-        let inner = unsafe { &self.bbq.as_ref() };
-
         // If there is no grant in progress, return early. This
         // generally means we are dropping the grant within a
         // wrapper structure
-        if !inner.write_in_progress.load(Acquire) {
+        if !self.ptr.write_in_progress().load(Acquire) {
             return;
         }
 
@@ -889,20 +980,20 @@ impl<'a, const N: usize> GrantW<'a, N> {
         // be careful writing to LAST
 
         // Saturate the grant commit
-        let len = self.buf.len();
+        let len = self.buf().len();
         let used = min(len, used);
 
-        let write = inner.write.load(Acquire);
-        atomic::fetch_sub(&inner.reserve, len - used, AcqRel);
+        let write = self.ptr.write().load(Acquire);
+        atomic::fetch_sub(self.ptr.reserve(), len - used, AcqRel);
 
-        let max = N;
-        let last = inner.last.load(Acquire);
-        let new_write = inner.reserve.load(Acquire);
+        let max = P::CAPACITY;
+        let last = self.ptr.last().load(Acquire);
+        let new_write = self.ptr.reserve().load(Acquire);
 
         if (new_write < write) && (write != max) {
             // We have already wrapped, but we are skipping some bytes at the end of the ring.
             // Mark `last` where the write pointer used to be to hold the line here
-            inner.last.store(write, Release);
+            self.ptr.last().store(write, Release);
         } else if new_write > last {
             // We're about to pass the last pointer, which was previously the artificial
             // end of the ring. Now that we've passed it, we can "unlock" the section
@@ -911,7 +1002,7 @@ impl<'a, const N: usize> GrantW<'a, N> {
             // Since new_write is strictly larger than last, it is safe to move this as
             // the other thread will still be halted by the (about to be updated) write
             // value
-            inner.last.store(max, Release);
+            self.ptr.last().store(max, Release);
         }
         // else: If new_write == last, either:
         // * last == max, so no need to write, OR
@@ -921,19 +1012,19 @@ impl<'a, const N: usize> GrantW<'a, N> {
 
         // Write must be updated AFTER last, otherwise read could think it was
         // time to invert early!
-        inner.write.store(new_write, Release);
+        self.ptr.write().store(new_write, Release);
 
         // Allow subsequent grants
-        inner.write_in_progress.store(false, Release);
+        self.ptr.write_in_progress().store(false, Release);
     }
 
     /// Configures the amount of bytes to be commited on drop.
     pub fn to_commit(&mut self, amt: usize) {
-        self.to_commit = self.buf.len().min(amt);
+        self.to_commit = self.buf().len().min(amt);
     }
 }
 
-impl<'a, const N: usize> GrantR<'a, N> {
+impl<P: StoragePointer> GrantR<P> {
     /// Release a sequence of bytes from the buffer, allowing the space
     /// to be used by later writes. This consumes the grant.
     ///
@@ -944,17 +1035,19 @@ impl<'a, const N: usize> GrantR<'a, N> {
     /// section while releasing.
     pub fn release(mut self, used: usize) {
         // Saturate the grant release
-        let used = min(self.buf.len(), used);
+        let used = min(self.buf().len(), used);
 
         self.release_inner(used);
         forget(self);
     }
 
     pub(crate) fn shrink(&mut self, len: usize) {
-        let mut new_buf: &mut [u8] = &mut [];
-        core::mem::swap(&mut self.buf, &mut new_buf);
-        let (new, _) = new_buf.split_at_mut(len);
-        self.buf = new;
+        unsafe {
+            let ptr = self.buf_mut().as_mut_ptr();
+            let old_len = self.buf().len();
+            assert!(len <= old_len);
+            self.buf = slice::from_raw_parts_mut(ptr, len);
+        }
     }
 
     /// Obtain access to the inner buffer for reading
@@ -987,7 +1080,7 @@ impl<'a, const N: usize> GrantR<'a, N> {
     /// # }
     /// ```
     pub fn buf(&self) -> &[u8] {
-        self.buf
+        unsafe { &*self.buf }
     }
 
     /// Obtain mutable access to the read grant
@@ -995,7 +1088,7 @@ impl<'a, const N: usize> GrantR<'a, N> {
     /// This is useful if you are performing in-place operations
     /// on an incoming packet, such as decryption
     pub fn buf_mut(&mut self) -> &mut [u8] {
-        self.buf
+        unsafe { &mut *self.buf }
     }
 
     /// Sometimes, it's not possible for the lifetimes to check out. For example,
@@ -1010,36 +1103,34 @@ impl<'a, const N: usize> GrantR<'a, N> {
     /// Additionally, you must ensure that a separate reference to this data is not created
     /// to this data, e.g. using `Deref` or the `buf()` method of this grant.
     pub unsafe fn as_static_buf(&self) -> &'static [u8] {
-        transmute::<&[u8], &'static [u8]>(self.buf)
+        transmute::<&[u8], &'static [u8]>(&*self.buf)
     }
 
     #[inline(always)]
     pub(crate) fn release_inner(&mut self, used: usize) {
-        let inner = unsafe { &self.bbq.as_ref() };
-
         // If there is no grant in progress, return early. This
         // generally means we are dropping the grant within a
         // wrapper structure
-        if !inner.read_in_progress.load(Acquire) {
+        if !self.ptr.read_in_progress().load(Acquire) {
             return;
         }
 
         // This should always be checked by the public interfaces
-        debug_assert!(used <= self.buf.len());
+        debug_assert!(used <= self.buf().len());
 
         // This should be fine, purely incrementing
-        let _ = atomic::fetch_add(&inner.read, used, Release);
+        let _ = atomic::fetch_add(self.ptr.read(), used, Release);
 
-        inner.read_in_progress.store(false, Release);
+        self.ptr.read_in_progress().store(false, Release);
     }
 
     /// Configures the amount of bytes to be released on drop.
     pub fn to_release(&mut self, amt: usize) {
-        self.to_release = self.buf.len().min(amt);
+        self.to_release = self.buf().len().min(amt);
     }
 }
 
-impl<'a, const N: usize> SplitGrantR<'a, N> {
+impl<'a, P: StoragePointer> SplitGrantR<'a, P> {
     /// Release a sequence of bytes from the buffer, allowing the space
     /// to be used by later writes. This consumes the grant.
     ///
@@ -1099,12 +1190,10 @@ impl<'a, const N: usize> SplitGrantR<'a, N> {
 
     #[inline(always)]
     pub(crate) fn release_inner(&mut self, used: usize) {
-        let inner = unsafe { &self.bbq.as_ref() };
-
         // If there is no grant in progress, return early. This
         // generally means we are dropping the grant within a
         // wrapper structure
-        if !inner.read_in_progress.load(Acquire) {
+        if !self.ptr.read_in_progress().load(Acquire) {
             return;
         }
 
@@ -1113,13 +1202,13 @@ impl<'a, const N: usize> SplitGrantR<'a, N> {
 
         if used <= self.buf1.len() {
             // This should be fine, purely incrementing
-            let _ = atomic::fetch_add(&inner.read, used, Release);
+            let _ = atomic::fetch_add(self.ptr.read(), used, Release);
         } else {
             // Also release parts of the second buffer
-            inner.read.store(used - self.buf1.len(), Release);
+            self.ptr.read().store(used - self.buf1.len(), Release);
         }
 
-        inner.read_in_progress.store(false, Release);
+        self.ptr.read_in_progress().store(false, Release);
     }
 
     /// Configures the amount of bytes to be released on drop.
@@ -1133,49 +1222,49 @@ impl<'a, const N: usize> SplitGrantR<'a, N> {
     }
 }
 
-impl<'a, const N: usize> Drop for GrantW<'a, N> {
+impl<P: StoragePointer> Drop for GrantW<P> {
     fn drop(&mut self) {
         self.commit_inner(self.to_commit)
     }
 }
 
-impl<'a, const N: usize> Drop for GrantR<'a, N> {
+impl<P: StoragePointer> Drop for GrantR<P> {
     fn drop(&mut self) {
         self.release_inner(self.to_release)
     }
 }
 
-impl<'a, const N: usize> Drop for SplitGrantR<'a, N> {
+impl<'a, P: StoragePointer> Drop for SplitGrantR<'a, P> {
     fn drop(&mut self) {
         self.release_inner(self.to_release)
     }
 }
 
-impl<'a, const N: usize> Deref for GrantW<'a, N> {
+impl<P: StoragePointer> Deref for GrantW<P> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.buf
+        unsafe { &*self.buf }
     }
 }
 
-impl<'a, const N: usize> DerefMut for GrantW<'a, N> {
+impl<P: StoragePointer> DerefMut for GrantW<P> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        self.buf
+        unsafe { &mut *self.buf }
     }
 }
 
-impl<'a, const N: usize> Deref for GrantR<'a, N> {
+impl<P: StoragePointer> Deref for GrantR<P> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.buf
+        unsafe { &*self.buf }
     }
 }
 
-impl<'a, const N: usize> DerefMut for GrantR<'a, N> {
+impl<P: StoragePointer> DerefMut for GrantR<P> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        self.buf
+        unsafe { &mut *self.buf }
     }
 }
 

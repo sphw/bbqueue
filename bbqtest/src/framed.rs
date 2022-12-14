@@ -1,10 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use bbqueue::BBBuffer;
+    use bbqueue::{BBBuffer, BufStorage};
 
     #[test]
     fn frame_wrong_size() {
-        let bb: BBBuffer<256> = BBBuffer::new();
+        let buf: BufStorage<256> = BufStorage::new();
+        let bb: BBBuffer<&BufStorage<256>> = BBBuffer::new(&buf);
+
         let (mut prod, mut cons) = bb.try_split_framed().unwrap();
 
         // Create largeish grants
@@ -25,7 +27,9 @@ mod tests {
 
     #[test]
     fn full_size() {
-        let bb: BBBuffer<256> = BBBuffer::new();
+        let buf: BufStorage<256> = BufStorage::new();
+        let bb: BBBuffer<&BufStorage<256>> = BBBuffer::new(&buf);
+
         let (mut prod, mut cons) = bb.try_split_framed().unwrap();
         let mut ctr = 0;
 
@@ -66,7 +70,9 @@ mod tests {
 
     #[test]
     fn frame_overcommit() {
-        let bb: BBBuffer<256> = BBBuffer::new();
+        let buf: BufStorage<256> = BufStorage::new();
+        let bb: BBBuffer<&BufStorage<256>> = BBBuffer::new(&buf);
+
         let (mut prod, mut cons) = bb.try_split_framed().unwrap();
 
         // Create largeish grants
@@ -93,7 +99,9 @@ mod tests {
 
     #[test]
     fn frame_undercommit() {
-        let bb: BBBuffer<512> = BBBuffer::new();
+        let buf: BufStorage<512> = BufStorage::new();
+        let bb: BBBuffer<&BufStorage<512>> = BBBuffer::new(&buf);
+
         let (mut prod, mut cons) = bb.try_split_framed().unwrap();
 
         for _ in 0..100_000 {
@@ -132,7 +140,8 @@ mod tests {
 
     #[test]
     fn frame_auto_commit_release() {
-        let bb: BBBuffer<256> = BBBuffer::new();
+        let buf: BufStorage<256> = BufStorage::new();
+        let bb: BBBuffer<&BufStorage<256>> = BBBuffer::new(&buf);
         let (mut prod, mut cons) = bb.try_split_framed().unwrap();
 
         for _ in 0..100 {
