@@ -231,6 +231,16 @@ impl<P: StoragePointer> FrameGrantR<P> {
         self.grant_r.release_inner(len);
     }
 
+    /// Release a frame to make the space available for future writing,
+    /// while taking a mutable reference
+    /// this is only to be used when implementing a custom drop function
+    pub unsafe fn unsafe_release(&mut self) {
+        // For a read grant, we have already shrunk the grant
+        // size down to the correct size
+        let len = self.grant_r.len();
+        self.grant_r.release_inner(len);
+    }
+
     /// Set whether the read fram should be automatically released
     pub fn auto_release(&mut self, is_auto: bool) {
         self.grant_r
