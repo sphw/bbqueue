@@ -544,7 +544,7 @@ impl<P: StoragePointer> Producer<P> {
     /// # bbqtest();
     /// # }
     /// ```
-    pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<P>> {
+    pub fn grant_exact(&self, sz: usize) -> Result<GrantW<P>> {
         //let inner = unsafe { &self.bbq.as_ref() };
 
         if atomic::swap(self.ptr.write_in_progress(), true, AcqRel) {
@@ -699,6 +699,14 @@ impl<P: StoragePointer> Producer<P> {
             ptr: self.ptr.clone(),
             to_commit: 0,
         })
+    }
+}
+impl<P: StoragePointer> Clone for Producer<P> {
+    fn clone(&self) -> Self {
+        self.ptr.prod_con_count().fetch_add(1, Acquire);
+        Self {
+            ptr: self.ptr.clone(),
+        }
     }
 }
 

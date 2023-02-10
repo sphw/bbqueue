@@ -83,6 +83,7 @@ use core::{
 };
 
 /// A producer of Framed data
+#[derive(Clone)]
 pub struct FrameProducer<P: StoragePointer> {
     pub(crate) producer: Producer<P>,
 }
@@ -92,7 +93,7 @@ impl<P: StoragePointer> FrameProducer<P> {
     ///
     /// This size does not include the size of the frame header. The exact size
     /// of the frame can be set on `commit`.
-    pub fn grant(&mut self, max_sz: usize) -> Result<FrameGrantW<P>> {
+    pub fn grant(&self, max_sz: usize) -> Result<FrameGrantW<P>> {
         let hdr_len = encoded_len(max_sz);
         Ok(FrameGrantW {
             grant_w: self.producer.grant_exact(max_sz + hdr_len)?,
