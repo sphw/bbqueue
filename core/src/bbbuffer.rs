@@ -915,6 +915,7 @@ pub struct GrantR<P: StoragePointer> {
 }
 
 unsafe impl<P: StoragePointer> Send for GrantR<P> {}
+unsafe impl<P: StoragePointer + Sync> Sync for GrantR<P> {}
 
 /// A structure representing up to two contiguous regions of memory that
 /// may be read from, and potentially "released" (or cleared)
